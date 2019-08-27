@@ -1,0 +1,237 @@
+转载自https://www.okcode.net/article/610
+
+2.1视图合并
+
+2.1.1 视图合并环境准备
+
+create table tests1 as select * from dba_objects;
+
+create table tests2 as select * from dba_objects;
+
+create index ix_tests1_id on tests1(object_id);
+
+create index ix_tests2_id on tests2(object_id);
+
+2.1.2 视图合并定义及产生原因
+
+视图合并，就是连接的对象中有视图，或者内联视图时，不是等视图把结果运行出来，再进行连接，而是直接和视图内的表进行连接。执行计划的直接表现就是该出现VIEW的地方没有VIEW，并且连接顺序可能会被彻底打乱。
+
+视图展开根据不同场景，对性能可能有益，也可能有害。
+
+表面看，视图合并打乱连接顺序，很多场景下还可能降低执行计划的阅读性，那优化器为什么还要产生视图合并呢？
+
+如果视图不合并，那么连接的对象就是视图检索出来的结果集，不能走索引，这样，在最优执行计划的选择上会有有害影响；
+
+然而，视图合并后，连接的对象变成了表，可以利用索引，连接方式的选择上也更加灵活。
+
+2.1.3 有害的视图合并
+
+这个是在做半连接和内连接的转换章节时偶尔运行出来的有害的视图合并，本来希望内联视图内去重复后，再连接，以减少连接返回数据量，但是，视图内的表直接连接后，因为数据倾斜原因，返回数据量超级大，导致性能问题。具体参考<半连接和内连接转换>专题。
+
+至于这个有害视图合并产生的原因，我个人猜测是优化器为了减少去重复运算的次数，
+
+我们的本意是做三次去重复，内联视图A B和最后的结果每次都去重复，但是优化器想在最后一次去重复，这里，我还的替数据库强大的优化器说句好话，并不是优化器不智能，而是优化器产生执行计划的基础，统计信息过期造成的，我们收集统计信息后，优化器也就纠正了这个性能低的执行计划。
+
+SELECT DISTINCT A.OWNER
+
+FROM (SELECT DISTINCT OWNER FROM TESTS1) A,
+
+      (SELECT DISTINCT OWNER FROM TESTS2) B
+
+WHERE A.OWNER=B.OWNER;
+
+
+
+一般建议用 NO_MERGE HINT 阻止视图合并，如下
+
+SELECT DISTINCT A.OWNER
+
+FROM (SELECT /*+ NO_MERGE*/ DISTINCT OWNER FROM TESTS1) A,
+
+      (SELECT /*+ NO_MERGE*/ DISTINCT OWNER FROM TESTS2) B
+
+WHERE A.OWNER=B.OWNER;
+
+
+
+不建议在视图内用ROWNUM>0阻止视图合并，因为ROWNUM>0还会阻止谓词推入，关于谓词推入，我们下面就会分析。
+
+SELECT DISTINCT A.OWNER
+
+FROM (SELECT DISTINCT OWNER FROM TESTS1 WHERE ROWNUM>0) A,
+
+     (SELECT DISTINCT OWNER FROM TESTS2 WHERE ROWNUM>0) B
+
+WHERE A.OWNER=B.OWNER;
+
+做人留一线，日后好相见，ROWNUM把视图合并和谓词推入都堵死，有点狠了。
+
+ 
+
+2.1.4 有益的视图合并
+
+既然存在有害的视图合并，必然存在有益的视图合并，先上例子，感观认识以下
+
+SELECT  A.OWNER,B.OBJECT_NAME
+
+FROM (SELECT OWNER ,OBJECT_ID,OBJECT_NAME FROM TESTS1 WHERE OWNER='SCOTT') A,
+
+     (SELECT OWNER ,OBJECT_ID,OBJECT_NAME FROM TESTS2) B
+
+WHERE A.OBJECT_ID=B.OBJECT_ID;
+
+
+
+视图合并后，小结果集驱动大表，大表走索引，结果秒出，啥也不说了，完美。
+
+假设不合并会怎样，我们用hint调整一下执行计划看看。
+
+SELECT  A.OWNER,B.OBJECT_NAME
+
+FROM (SELECT /*+ NO_MERGE*/ OWNER ,OBJECT_ID,OBJECT_NAME FROM TESTS1 WHERE OWNER='SCOTT') A,
+
+     (SELECT /*+ NO_MERGE*/ OWNER ,OBJECT_ID,OBJECT_NAME FROM TESTS2) B
+
+WHERE A.OBJECT_ID=B.OBJECT_ID;
+
+
+
+视图B不能有效利用索引，逻辑读多出来接近一倍。
+
+2.2 谓词推入
+
+2.2.1 谓词推入环境准备
+
+create table tests1 as select * from dba_objects;
+
+create table tests2 as select * from dba_objects;
+
+ 
+
+create index ix_tests1_id on tests1(object_id);
+
+create index ix_tests2_id on tests2(object_id);
+
+ 
+
+create index ix_tests1_ownerid on tests1(owner,object_id);
+
+create index ix_tests2_ownerid on tests2(owner,object_id);
+
+2.2.2 谓词推入定义及产生原因
+
+当视图无法合并时，谓词会推入到视图内部，分为常量谓词推入和连接列谓词推入，常量谓词推入通常时为了提前过滤，比较好理解，在这里就不多说了；而连接列谓词推入有好有坏，下面我们重点分析。
+
+关于谓词推入产生的原因，常量谓词推入就是为了提前过滤数据；
+
+连接列的谓词推入一般是谓词推入的条件满足嵌套循环优化的前提下进行的，首先，谓词推入产生的前提是视图不可以合并，那么和视图内的表产生直接产生HASH连接就不可能了，但是通过连接列谓词推入，视图外的结果集可以传值给视图内的表，用嵌套循环的检索方法获取数据，如果视图外的结果集不是很大，视图内的表可以有效的利用索引，那么这种检索方式满足了嵌套循环优化的利用前提，那么这样的连接列谓词推入就是有益的谓词推入。
+
+执行计划中，如果有PUSHED PREDICATE关键字，就是发生了谓词推入。
+
+※本专题参考落落老师大作 《SQL优化核心思想》
+
+ 
+
+2.2.3 有害的连接列谓词推入
+
+SELECT  COUNT(T.OBJECT_NAME)
+
+FROM TESTS1 T,
+
+     (SELECT * FROM TESTS1 T1 
+
+      UNION 
+
+      SELECT * FROM TESTS2 T2 ) V 
+
+WHERE T.OWNER=V.OWNER AND T.OBJECT_ID <60;
+
+
+
+这个执行计划的产生要靠缘分，大家不一定能还原，因为这个执行计划产生的原因也是统计信息不准确，即便是大家删除统计信息，但是oracle强大的优化器还有个执行计划反馈机制，会逐步进化自己的执行计划。
+
+那么，既然我碰见了，就聊一下产生的原因
+
+首先我们看看OBJECT_ID <60的owner有谁。
+
+select distinct  owner from tests1 where OBJECT_ID <60;
+
+结果是只有SYS，
+
+select count(*) from   tests1 where owner ='SYS';
+
+结果是30861，连接列谓词推入后3万和3万走嵌套循环，可就是3万乘以3万啊，那么性能直接报废，既然如此，优化器不可能算不出来，但是，统计信息不准确，看执行计划的E-ROWS，连接列谓词推入的地方只有几百行，那么，还可以利用一下索引（这个OWNER作为开头列的索引是不合理的索引，因为OWNER基数太低，过滤性较差，并且数据倾斜严重），然后走了连接列谓词推入，嵌套循环。
+
+那下面，我们阻止这个问题的发生。
+
+同视图合并，用ROWNUM这总把路堵死的做法，还是不推荐。
+
+SELECT  COUNT(T.OBJECT_NAME)
+
+FROM TESTS1 T,
+
+     (SELECT * FROM TESTS1 T1  WHERE ROWNUM>0
+
+      UNION 
+
+      SELECT * FROM TESTS2 T2  WHERE ROWNUM>0) V 
+
+WHERE T.OWNER=V.OWNER AND T.OBJECT_ID <60;
+
+那我们用HINT阻止连接列谓词推入
+
+SELECT /*+ NO_PUSH_PRED(V)*/ COUNT(T.OBJECT_NAME)
+
+FROM TESTS1 T,
+
+     (SELECT * FROM TESTS1 T1 
+
+      UNION 
+
+      SELECT * FROM TESTS2 T2 ) V 
+
+WHERE T.OWNER=V.OWNER AND T.OBJECT_ID <60;
+
+
+
+禁止连接列谓词推入后，逻辑读大量减少。
+
+2.2.4 有益的连接列谓词推入
+
+SELECT COUNT(T.OBJECT_NAME)
+
+FROM TESTS1 T,
+
+     (SELECT * FROM TESTS1 T1 
+
+      UNION 
+
+      SELECT * FROM TESTS2 T2 ) V 
+
+WHERE T.OBJECT_ID=V.OBJECT_ID
+
+  AND T.OWNER ='SCOTT';
+
+
+
+连接列谓词推入后，嵌套循环满足小结果集驱动大表，大表走索引，是性能较好的执行计划。
+
+假设我们禁止视图合并会怎样？下面确认。
+
+SELECT /*+ NO_PUSH_PRED(V)*/ COUNT(T.OBJECT_NAME)
+
+FROM TESTS1 T,
+
+     (SELECT * FROM TESTS1 T1 
+
+      UNION 
+
+      SELECT * FROM TESTS2 T2 ) V 
+
+WHERE T.OBJECT_ID=V.OBJECT_ID
+
+AND T.OWNER ='SCOTT';
+
+
+
+因为谓词无法推入，只能和视图V走HASH，这样，逻辑读大量增加（136增加到2080），性能下降。
