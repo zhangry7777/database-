@@ -1,0 +1,24 @@
+生成awr报告
+数据库端：
+$su - oracle
+$pwd
+看下当前路径  /home/oracle
+$sqlplus / as  sysdba
+>@?/rdbms/admin/awrrpt.sql
+按照提示填好格式、天数、间隔、文件名
+
+
+从docker下载到服务器
+$pwd
+当前路径  /home/ubuntu
+$docker cp oracle11g-en:/home/oracle/pro_awr.html  /home/ubuntu
+
+
+
+从服务器用sftp下载到本地
+sftp>cd /home/ubuntu
+写明要下载的路径
+sftp>lcd e:\
+下载到本地
+sftp>get pro_awr.html 
+
